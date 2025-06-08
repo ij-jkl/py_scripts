@@ -1,101 +1,119 @@
 ﻿import re
-import csv
-from io import StringIO
 
+def preprocess_line(line):
+    return re.sub(r"(?<=')(\d)\'(\d{1,2})\"", r"\1''\2\"", line)
 
 def split_sql_values(value_str):
-    cleaned = value_str.replace("''", "'")
+    result = []
+    current = ''
+    inside_quotes = False
+    i = 0
+    while i < len(value_str):
+        char = value_str[i]
+        if char == "'":
+            if inside_quotes and i + 1 < len(value_str) and value_str[i + 1] == "'":
+                current += "'"
+                i += 1
+            else:
+                inside_quotes = not inside_quotes
+        elif char == ',' and not inside_quotes:
+            result.append(current.strip())
+            current = ''
+        else:
+            current += char
+        i += 1
+    if current:
+        result.append(current.strip())
+    return result
 
-    fake_csv = StringIO(cleaned)
-    reader = csv.reader(fake_csv, quotechar="'", delimiter=',', escapechar='\\', skipinitialspace=True)
-
-    return [part.strip() for part in next(reader)]
-
-
-def parse_market_value(value_str):
-    """Parses a market value string like '$5.8M - $7.6M', '$500k', or '$500.356'."""
+def parse_market_value(value_str, line_number, player_name="Unknown"):
+    if "not for sale" in value_str.lower():
+        return 0, 0
 
     def parse_single(val):
-        val = val.strip().replace('$', '')
 
-        if 'M' in val:
-            return float(val.replace('M', '')) * 1_000_000
-        elif 'K' in val:
-            return float(val.replace('K', '')) * 1_000
+        val = val.strip().replace('$', '').upper()
+        match = re.match(r"([\d.]+)([MK]?)", val)
+        if not match:
+            return 0.0
+        number = safe_float(match.group(1), line_number, "MarketValue", player_name)
+        suffix = match.group(2)
+        if suffix == 'M':
+            return number * 1_000_000
+        elif suffix == 'K':
+            return number * 1_000
+        return number
+
+    try:
+        if '-' in value_str:
+            parts = value_str.split('-')
+            return int(parse_single(parts[0])), int(parse_single(parts[1]))
         else:
-            return float(val)
-
-    if '-' in value_str:
-        parts = value_str.split('-')
-        min_val = parse_single(parts[0].strip())
-        max_val = parse_single(parts[1].strip())
-        return int(min_val), int(max_val)
-    else:
-        val = parse_single(value_str)
-        return int(val), int(val)
-
+            val = parse_single(value_str)
+            return int(val), int(val)
+    except:
+        return 0, 0
 
 def convert_height(height_str):
-    match = re.match(r"(\d+)'(\d+)\"", height_str)
+    height_str = height_str.strip().lower()
+    match = re.match(r"(\d+)'(\d+)", height_str)
 
     if match:
         feet = int(match.group(1))
         inches = int(match.group(2))
         return round((feet * 12 + inches) * 2.54, 2)
+    match2 = re.match(r"(\d{1})(\d{2})$", height_str)
 
-    match2 = re.match(r"(\d{1})(\d{2})\"?", height_str)
     if match2:
         feet = int(match2.group(1))
         inches = int(match2.group(2))
         return round((feet * 12 + inches) * 2.54, 2)
+    match3 = re.match(r"(\d+)\s*cm", height_str)
 
+    if match3:
+        return float(match3.group(1))
+    if height_str.isdigit():
+        return float(height_str)
     return 0.0
-
 
 def parse_appearances(appearance_str):
     match = re.match(r"(\d+)", appearance_str)
-
     if match:
         return int(match.group(1))
     else:
-        raise ValueError(f"Cannot parse appearances: {appearance_str}")
-
+        return 0
 
 def convert_weight(weight_str):
-    """Convert weight from '152 lbs' to kilograms."""
 
     match = re.match(r"(\d+)\s*lbs", weight_str)
-
     if match:
-        pounds = int(match.group(1))
-        return round(pounds * 0.453592, 2)
+        return round(int(match.group(1)) * 0.453592, 2)
     return 0.0
 
+def safe_float(value_str, line_number, field_name, player_name="Unknown"):
+    try:
+        raw = str(value_str).strip()
+        cleaned = raw.strip("'\"").strip().lower()
+        if cleaned in ("unknown", "null", "none", ""):
+            return 0.0
+        return float(cleaned)
+    except:
+        return 0.0
 
-def transform_insert_line(line):
+def transform_insert_line(line, line_number):
+
     if not line.strip().lower().startswith("insert into players"):
         return None
 
-    print(f"[DEBUG] Processing line:\n{line.strip()}")
-    values = re.findall(r"VALUES\s*\((.*?)\);", line, re.DOTALL)
-
-    if not values:
-        print("[DEBUG] No VALUES() found.")
+    line = preprocess_line(line)
+    match = re.search(r"values\s*\((.*)\)\s*;", line.strip(), re.IGNORECASE | re.DOTALL)
+    if not match:
         return None
 
-    raw_values = values[0]
-
-    print(f"[DEBUG] Raw values string:\n{raw_values}\n")
-
+    raw_values = match.group(1)
     parts = split_sql_values(raw_values)
 
-    print(f"[DEBUG] Parsed {len(parts)} values:")
-
-    for i, part in enumerate(parts):
-        print(f"  [{i}] -> {part}")
-
     if len(parts) != 29:
-        print(f"[ERROR] Skipping malformed line: Expected 29 parts, got {len(parts)}.")
         return None
 
     try:
@@ -117,25 +135,26 @@ def transform_insert_line(line):
         assists = int(parts[14])
         key_passes = int(parts[15])
         passes_completed = int(parts[16])
-        mv_min, mv_max = parse_market_value(parts[17].strip("'"))
+        mv_min, mv_max = parse_market_value(parts[17].strip("'"), line_number, name)
         dribbles_made = int(parts[18])
-        goals_per_90 = float(parts[19])
-        shots_on_target_per_90 = float(parts[20])
-        assists_per_90 = float(parts[21])
-        key_passes_per_90 = float(parts[22])
-        passes_completed_per_90 = float(parts[23])
-        conversion_rate = float(parts[24])
-        shot_accuracy = float(parts[25])
-        goal_involvement_per_90 = float(parts[26])
-        normalized_rating = float(parts[28])
+        goals_per_90 = safe_float(parts[19], line_number, "GoalsPer90", name)
+        shots_on_target_per_90 = safe_float(parts[20], line_number, "ShotsOnTargetPer90", name)
+        assists_per_90 = safe_float(parts[21], line_number, "AssistsPer90", name)
+        key_passes_per_90 = safe_float(parts[22], line_number, "KeyPassesPer90", name)
+        passes_completed_per_90 = safe_float(parts[23], line_number, "PassesCompletedPer90", name)
+        conversion_rate = safe_float(parts[24], line_number, "ConversionRate", name)
+        shot_accuracy = safe_float(parts[25], line_number, "ShotAccuracy", name)
+        goal_involvement_per_90 = safe_float(parts[26], line_number, "GoalInvolvementPer90", name)
+        rating = safe_float(parts[27], line_number, "Rating", name)
+        normalized_rating = safe_float(parts[28], line_number, "NormalizedRating", name)
 
         return f"""INSERT INTO player_stats (
-    name, position, club, nationality, height_cm, weight_kg, preferred_foot, age,
-    appearances, subs, starts, minutes_played, goals, shots, shots_on_target,
-    assists, key_passes, passes_completed, market_value_min, market_value_max,
-    dribbles_made, goals_per_90, shots_on_target_per_90, assists_per_90,
-    key_passes_per_90, passes_completed_per_90, conversion_rate, shot_accuracy,
-    goal_involvement_per_90
+    Name, Position, Club, Nationality, HeightCm, WeightKg, PreferredFoot, Age,
+    Appearances, Subs, Starts, MinutesPlayed, Goals, Shots, ShotsOnTarget,
+    Assists, KeyPasses, PassesCompleted, MarketValueMin, MarketValueMax,
+    DribblesMade, GoalsPer90, ShotsOnTargetPer90, AssistsPer90,
+    KeyPassesPer90, PassesCompletedPer90, ConversionRate, ShotAccuracy,
+    GoalInvolvementPer90
 ) VALUES (
     '{name}', '{position}', '{club}', '{nationality}', {height_cm}, {weight_kg}, '{preferred_foot}', {age},
     {appearances}, {subs}, {starts}, {minutes_played}, {goals}, {shots}, {shots_on_target},
@@ -144,23 +163,19 @@ def transform_insert_line(line):
     {key_passes_per_90}, {passes_completed_per_90}, {conversion_rate}, {shot_accuracy},
     {goal_involvement_per_90}
 );"""
-
-    except Exception as e:
-        print(f"[ERROR] Failed to parse line: {e}")
+    except:
         return None
-
 
 def process_sql_file(input_path, output_path):
     with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
-        for line in infile:
-            transformed = transform_insert_line(line)
+        for line_number, line in enumerate(infile, start=1):
+            transformed = transform_insert_line(line, line_number)
             if transformed:
                 outfile.write(transformed + '\n')
 
-
 if __name__ == "__main__":
 
-    input_path = r"C:\Users\ijordan\Desktop\BORRAR\insert_all_strikers.sql"
-    output_path = r"C:\Users\ijordan\Desktop\BORRAR\processed_strikers.sql"
+    input_path = r"C:\Users\Isaac\Desktop\Programacion\PyScripts\insert_all_strikers.sql"
+    output_path = r"C:\Users\Isaac\Desktop\Programacion\PyScripts\processed_strikers.sql"
 
     process_sql_file(input_path, output_path)
